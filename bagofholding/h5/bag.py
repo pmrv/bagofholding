@@ -27,9 +27,21 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
 
     The underlying file structure is directly representative of the structure of the
     decomposed object being stored, and `attrs` are used to store metadata.
+
+    Strings (metadata fields and string content) are written as fixed-length UTF-8
+    where they round-trip exactly. Variable-length strings live in the HDF5 global
+    heap, and every write session that stores one opens a new heap collection of at
+    least 4 kB that later sessions never reuse; with many small saves into a shared
+    file this leak dominates the file size.
+
+    Arrays of at least `compression_threshold` bytes are written gzip-compressed in a
+    single chunk (`None` disables compression). Fixed-length byte-string arrays
+    (`dtype.kind == "S"`) are stored natively.
     """
 
     _content_key: ClassVar[str] = "content_type"
+    compression_threshold: ClassVar[int | None] = 512
+    compression_level: ClassVar[int] = 4
 
     @classmethod
     def get_bag_info(cls) -> BagInfo:
@@ -120,8 +132,20 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
     def _resolve(self, path: str) -> h5py.Group | h5py.Dataset:
         return self.file if path in ("/", "") else self.file[path]
 
+    @staticmethod
+    def _fixed_length(s: str) -> np.bytes_ | None:
+        """
+        `s` as a fixed-length UTF-8 byte string, or `None` where that would not
+        round-trip: empty strings, strings with NUL characters (fixed-length strings
+        are NUL-padded) and strings with surrogates (not encodable).
+        """
+        if not s or "\x00" in s or has_surrogates(s):
+            return None
+        return np.bytes_(s.encode("utf-8"))
+
     def _pack_field(self, path: str, key: str, value: str) -> None:
-        self._resolve(path).attrs[key] = value
+        fixed = self._fixed_length(value)
+        self._resolve(path).attrs[key] = value if fixed is None else fixed
 
     def _unpack_field(self, path: str, key: str) -> str | None:
         try:
@@ -137,6 +161,8 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
             encoded = obj.encode("utf-16", errors="surrogatepass")
             self.file.create_dataset(path, data=np.void(encoded))
             self.file[path].attrs["_surrogate_str"] = True
+        elif (fixed := self._fixed_length(obj)) is not None:
+            self.file.create_dataset(path, data=fixed)
         else:
             self.file.create_dataset(
                 path, data=obj, dtype=h5py.string_dtype(encoding="utf-8")
@@ -164,9 +190,7 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
 
     def pack_long(self, obj: int, path: str) -> None:
         if int_overflows(obj):
-            self.file.create_dataset(
-                path, data=str(obj), dtype=h5py.string_dtype(encoding="utf-8")
-            )
+            self.file.create_dataset(path, data=np.bytes_(str(obj).encode("utf-8")))
             self.file[path].attrs["_bigint"] = True
         else:
             self._pack_raw(obj, path)
@@ -220,12 +244,30 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
     def get_bespoke_content_class(
         self, obj: object
     ) -> type[BespokeItem[Any, Self]] | None:
-        if type(obj) is np.ndarray and obj.dtype.type in H5PY_DTYPE_WHITELIST:
+        if type(obj) is np.ndarray and (
+            obj.dtype.type in H5PY_DTYPE_WHITELIST
+            or (obj.dtype.kind == "S" and obj.dtype.itemsize > 0)
+        ):
             return cast(type[BespokeItem[Any, Self]], Array)
         return None
 
     def pack_array(self, obj: ArrayType, path: str) -> None:
-        self.file.create_dataset(path, data=obj)
+        if (
+            self.compression_threshold is not None
+            and obj.ndim > 0
+            and obj.size > 0
+            and obj.nbytes >= self.compression_threshold
+        ):
+            self.file.create_dataset(
+                path,
+                data=obj,
+                # one chunk: arrays are always read whole; h5py caps a chunk at 4 GiB
+                chunks=obj.shape if obj.nbytes < 2**30 else True,
+                compression="gzip",
+                compression_opts=self.compression_level,
+            )
+        else:
+            self.file.create_dataset(path, data=obj)
 
     def unpack_array(self, path: str) -> ArrayType:
         return cast(ArrayType, self.file[path][()])

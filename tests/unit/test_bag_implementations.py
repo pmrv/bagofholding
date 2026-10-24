@@ -98,6 +98,11 @@ class AbstractTestNamespace:
         def bag_class(cls) -> type[bag.Bag]: ...
 
         @classmethod
+        def content_type_overrides(cls) -> dict[str, type]:
+            """Cases whose content type differs for this implementation."""
+            return {}
+
+        @classmethod
         def setUpClass(cls):
             cls.save_name = "savefile"
 
@@ -306,6 +311,7 @@ class AbstractTestNamespace:
                 "cycle_frozenset": c.Reducible,
                 "cycle_constructor_args": c.Reducible,
             }
+            expected_content_types.update(self.content_type_overrides())
             cases = build_cases()
             self.assertEqual(
                 set(cases),
@@ -861,6 +867,11 @@ class TestH5BagBagImplementation(AbstractTestNamespace.TestBagImplementation):
     @classmethod
     def bag_class(cls) -> type[bagofholding.h5.bag.H5Bag]:
         return bagofholding.h5.bag.H5Bag
+
+    @classmethod
+    def content_type_overrides(cls) -> dict[str, type]:
+        # fixed-length byte-string arrays are stored natively
+        return {"ndarray_bytes": h5c.Array, "ndarray_bytes_ragged": h5c.Array}
 
 
 class TestH5TrieBagBagImplementation(AbstractTestNamespace.TestBagImplementation):
