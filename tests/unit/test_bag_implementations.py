@@ -674,6 +674,27 @@ class TestH5BagBagImplementation(AbstractTestNamespace.TestBagImplementation):
     def bag_class(cls) -> type[bagofholding.h5.bag.H5Bag]:
         return bagofholding.h5.bag.H5Bag
 
+    def test_group_cache_eviction(self):
+        """
+        Groups are cached by path while packing and unpacking; objects with more
+        groups than the cache holds must still round-trip, and partial loads must
+        resolve correctly whether or not their ancestors are cached.
+        """
+        bag_class = self.bag_class()
+        n = 2 * bag_class._group_cache_size
+        obj = {f"k{i}": {"inner": [i, {"leaf": str(i)}]} for i in range(n)}
+
+        bag_class.save(obj, self.save_name)
+        bag = bag_class(self.save_name)
+        self.assertEqual(obj, bag.load())
+        with bag:
+            for i in (0, n // 2, n - 1, 0):
+                self.assertEqual(
+                    str(i), bag.load(f"object/k{i}/inner/i1/leaf"), msg=f"k{i}"
+                )
+            self.assertLessEqual(len(bag._groups), bag_class._group_cache_size)
+        self.assertEqual(0, len(bag._groups), msg="Cache is cleared on close")
+
 
 class TestH5TrieBagBagImplementation(AbstractTestNamespace.TestBagImplementation):
     @classmethod
