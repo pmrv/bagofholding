@@ -11,7 +11,14 @@ import numpy as np
 from bagofholding.bag import Bag, BagInfo
 from bagofholding.content import BespokeItem, has_surrogates
 from bagofholding.exceptions import InvalidMetadataError, NotAGroupError
-from bagofholding.h5.content import Array, ArrayPacker, ArrayType, int_overflows
+from bagofholding.h5.content import (
+    Array,
+    ArrayType,
+    ObjectArray,
+    StringArrayPacker,
+    int_overflows,
+    is_plain_object_array,
+)
 from bagofholding.h5.context import HasH5FileContext
 from bagofholding.h5.dtypes import H5PY_DTYPE_WHITELIST
 from bagofholding.metadata import Metadata, VersionScrapingMap, VersionValidatorType
@@ -22,7 +29,7 @@ class H5Info(BagInfo):
     libver_str: str = "latest"
 
 
-class H5Bag(Bag, HasH5FileContext, ArrayPacker):
+class H5Bag(Bag, HasH5FileContext, StringArrayPacker):
     """
     A bag using HDF5 files based on `h5py`.
 
@@ -289,6 +296,8 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
     ) -> type[BespokeItem[Any, Self]] | None:
         if type(obj) is np.ndarray and obj.dtype.type in H5PY_DTYPE_WHITELIST:
             return cast(type[BespokeItem[Any, Self]], Array)
+        if is_plain_object_array(obj):
+            return cast(type[BespokeItem[Any, Self]], ObjectArray)
         return None
 
     def pack_array(self, obj: ArrayType, path: str) -> None:
@@ -296,3 +305,10 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
 
     def unpack_array(self, path: str) -> ArrayType:
         return cast(ArrayType, self._resolve(path)[()])
+
+    def pack_string_array(self, obj: list[str], path: str) -> None:
+        dtype = h5py.string_dtype(encoding="utf-8")
+        self._create_dataset(path, data=np.array(obj, dtype=dtype), dtype=dtype)
+
+    def unpack_string_array(self, path: str) -> list[str]:
+        return cast(list[str], self._resolve(path).asstr()[()].tolist())

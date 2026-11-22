@@ -17,6 +17,7 @@ from static.objects import (
     ExReducta,
     NestedParent,
     Parent,
+    Phase,
     Recursing,
     SomeData,
     is_a_lambda,
@@ -605,6 +606,62 @@ class AbstractTestNamespace:
                 self.assertEqual(obj_a, CustomExtBag(f"{file_path}/a").load())
                 self.assertEqual(obj_b, CustomExtBag(f"{file_path}/b").load())
 
+        def test_object_arrays(self):
+            shared = SomeData("shared")
+            arrays = {
+                "empty": np.array([], dtype=object),
+                "zero-d": np.array(SomeData(), dtype=object),
+                "strings": np.array(
+                    ["fcc", "hcp", "fcc", "", "Ă", "\ud800"], dtype=object
+                ),
+                "enums": np.array([Phase.FCC, Phase.HCP, Phase.FCC], dtype=object),
+                "scalars": np.array(
+                    [None, 1, True, 1.0, -0.0, 0.0, float("nan"), b"1", 1j, "1"],
+                    dtype=object,
+                ),
+                "objects": np.array([shared, SomeData(), shared, [1, 2]], dtype=object),
+                "2d": np.array([["a", 1], [Phase.LIQUID, None]], dtype=object),
+                "fortran": np.asfortranarray(
+                    np.array([["a", "b", "c"], [1, 2, 3]], dtype=object)
+                ),
+            }
+            for name, arr in arrays.items():
+                with self.subTest(name):
+                    self.bag_class().save(arr, self.save_name)
+                    reloaded = self.bag_class()(self.save_name).load()
+                    self.assertIs(type(reloaded), np.ndarray)
+                    self.assertEqual(arr.dtype, reloaded.dtype)
+                    self.assertEqual(arr.shape, reloaded.shape)
+                    self.assertEqual(
+                        arr.flags.f_contiguous, reloaded.flags.f_contiguous
+                    )
+                    for a, b in zip(arr.ravel(), reloaded.ravel(), strict=True):
+                        self.assertIs(type(a), type(b))
+                        if isinstance(a, float):
+                            self.assertEqual(repr(a), repr(b))  # nan and signed zero
+                        else:
+                            self.assertEqual(a, b)
+                    os.remove(self.save_name)
+
+        def test_object_array_references(self):
+            shared = SomeData("shared")
+            arr = np.array([shared, SomeData(), shared, Phase.FCC], dtype=object)
+            cyclic = np.empty(2, dtype=object)
+            cyclic[0] = cyclic
+            cyclic[1] = "not a cycle"
+            obj = {"arr": arr, "again": arr, "shared": shared, "cyclic": cyclic}
+
+            self.bag_class().save(obj, self.save_name)
+            reloaded = self.bag_class()(self.save_name).load()
+
+            self.assertIs(reloaded["arr"], reloaded["again"])
+            self.assertIs(reloaded["arr"][0], reloaded["arr"][2])
+            self.assertIsNot(reloaded["arr"][0], reloaded["arr"][1])
+            self.assertIs(reloaded["arr"][0], reloaded["shared"])
+            self.assertIs(reloaded["arr"][3], Phase.FCC)
+            self.assertIs(reloaded["cyclic"][0], reloaded["cyclic"])
+            self.assertEqual(reloaded["cyclic"][1], "not a cycle")
+
         def test_subaccess(self):
             r = Recursing(2)
             self.bag_class().save(r, self.save_name)
@@ -694,6 +751,37 @@ class TestH5BagBagImplementation(AbstractTestNamespace.TestBagImplementation):
                 )
             self.assertLessEqual(len(bag._groups), bag_class._group_cache_size)
         self.assertEqual(0, len(bag._groups), msg="Cache is cleared on close")
+
+    def test_object_array_storage_does_not_scale_with_repeats(self):
+        """
+        Object arrays are stored by their unique elements, not one node per element.
+        Long pandas columns of strings or enums would otherwise be very slow.
+        """
+        n_paths = {}
+        for n in (10, 1000):
+            arr = np.array(
+                [Phase.FCC, "fcc", Phase.HCP, "unique"] * n
+                + [str(i) for i in range(n)],
+                dtype=object,
+            )
+            self.bag_class().save(arr, self.save_name)
+            bag = self.bag_class()(self.save_name)
+            self.assertEqual(
+                h5c.ObjectArray.__name__,
+                bag["object"].content_type.split(".")[-1],
+            )
+            np.testing.assert_array_equal(arr, bag.load())
+            n_paths[n] = len(bag.list_paths())
+            os.remove(self.save_name)
+        self.assertEqual(n_paths[10], n_paths[1000])
+
+    def test_object_array_partial_load(self):
+        arr = np.array([Phase.FCC, "a", Phase.FCC], dtype=object)
+        self.bag_class().save({"col": arr}, self.save_name)
+        bag = self.bag_class()(self.save_name)
+        np.testing.assert_array_equal(arr, bag.load("object/col"))
+        self.assertEqual(["a"], bag.load("object/col/strings"))
+        self.assertEqual((Phase.FCC,), bag.load("object/col/others"))
 
 
 class TestH5TrieBagBagImplementation(AbstractTestNamespace.TestBagImplementation):
