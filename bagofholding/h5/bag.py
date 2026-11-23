@@ -124,10 +124,14 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
         self._resolve(path).attrs[key] = value
 
     def _unpack_field(self, path: str, key: str) -> str | None:
+        # Resolve outside the `try`: h5py also raises KeyError when an object exists
+        # but can't be opened (e.g. a newer HDF5 format), which is not a missing field
+        attrs = self._resolve(path).attrs
         try:
-            return self.maybe_decode(self._resolve(path).attrs[key])
+            value = attrs[key]
         except KeyError:
             return None
+        return self.maybe_decode(value)
 
     def pack_empty(self, path: str) -> None:
         self.file.create_dataset(path, data=h5py.Empty(dtype="f"))

@@ -260,12 +260,14 @@ class TrieH5Bag(Bag, HasH5FileContext, ArrayPacker):
         self._pack_trie(self._field_to_path(path, key), type_index, len(data_list) - 1)
 
     def _unpack_field(self, path: str, key: str) -> str | None:
+        # Only a missing trie entry means a missing field; let h5py errors from the
+        # read itself (also KeyErrors, e.g. for a newer HDF5 format) propagate
+        field_path = self._field_to_path(path, key)
         try:
-            return self.maybe_decode(
-                cast(str, self._read_pathlike(self._field_to_path(path, key)))
-            )
+            self._read_trie(field_path)
         except KeyError:
             return None
+        return self.maybe_decode(cast(str, self._read_pathlike(field_path)))
 
     def _read_pathlike(self, path: str) -> H5Scalar:
         # A real path or one with the field delimiter to find a metadata field

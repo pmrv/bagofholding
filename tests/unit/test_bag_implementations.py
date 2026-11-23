@@ -34,6 +34,7 @@ import bagofholding.h5.triebag
 from bagofholding import (
     BagMismatchError,
     EnvironmentMismatchError,
+    InvalidMetadataError,
     ModuleForbiddenError,
     NoVersionError,
     PickleProtocolError,
@@ -862,8 +863,54 @@ class TestH5BagBagImplementation(AbstractTestNamespace.TestBagImplementation):
     def bag_class(cls) -> type[bagofholding.h5.bag.H5Bag]:
         return bagofholding.h5.bag.H5Bag
 
+    def test_unopenable_object_is_not_missing_metadata(self):
+        # h5py raises KeyError for objects it finds but can't open, e.g. one written
+        # in a newer HDF5 format; that must not read as "missing metadata"
+        self.bag_class().save(True, self.save_name)
+        bag = self.bag_class()(self.save_name)
+        with bag:
+            self.assertIsNone(bag._unpack_field("object", "no_such_field"))
+        unopenable = KeyError("Unable to synchronously open object (bad version)")
+        original = bagofholding.h5.bag.H5Bag._resolve
+
+        def resolve(bag_self, path):
+            if path.rstrip("/").endswith("object"):
+                raise unopenable
+            return original(bag_self, path)
+
+        with (
+            mock.patch.object(bagofholding.h5.bag.H5Bag, "_resolve", resolve),
+            self.assertRaises(KeyError) as ctx,
+        ):
+            bag.load()
+        self.assertIs(unopenable, ctx.exception)
+        self.assertNotIsInstance(ctx.exception, InvalidMetadataError)
+
 
 class TestH5TrieBagBagImplementation(AbstractTestNamespace.TestBagImplementation):
     @classmethod
     def bag_class(cls) -> type[bagofholding.h5.triebag.TrieH5Bag]:
         return bagofholding.h5.triebag.TrieH5Bag
+
+    def test_unopenable_object_is_not_missing_metadata(self):
+        # A missing trie entry is a missing field; a KeyError from h5py while reading
+        # an existing entry (e.g. a newer HDF5 format) must propagate
+        self.bag_class().save(True, self.save_name)
+        bag = self.bag_class()(self.save_name)
+        self.assertIsNone(bag._unpack_field("object", "no_such_field"))
+        unopenable = KeyError("Unable to synchronously open object (bad version)")
+        original = bagofholding.h5.triebag.TrieH5Bag._read_pathlike
+
+        def read_pathlike(bag_self, path):
+            if bag_self._field_delimiter in path:
+                raise unopenable
+            return original(bag_self, path)
+
+        with (
+            mock.patch.object(
+                bagofholding.h5.triebag.TrieH5Bag, "_read_pathlike", read_pathlike
+            ),
+            self.assertRaises(KeyError) as ctx,
+        ):
+            bag.load()
+        self.assertIs(unopenable, ctx.exception)
