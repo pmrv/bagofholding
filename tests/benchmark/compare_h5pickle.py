@@ -5,6 +5,7 @@ Run as `python tests/benchmark/compare_h5pickle.py`.
 """
 
 import collections
+import io
 import os
 import pathlib
 import pickle
@@ -22,18 +23,29 @@ import bagofholding as boh  # noqa: E402
 from bagofholding import h5pickle  # noqa: E402
 
 
-def same(a, b):
-    if type(a) is not type(b):
-        return False
-    try:
-        if pickle.dumps(a, 4) == pickle.dumps(b, 4):
-            return True
-    except Exception:
-        pass
-    try:
-        return bool(np.all(a == b))
-    except Exception:
-        return False
+class Canonical(pickle._Pickler):
+    """Pickles equal strings alike, whether or not they are one object."""
+
+    sort = False  # whether to write string-keyed dicts in alphabetical order
+
+    def memoize(self, obj):
+        if type(obj) not in (str, bytes):
+            super().memoize(obj)
+
+    def _batch_setitems(self, items, *args):
+        items = list(items)
+        if self.sort and all(type(key) is str for key, _ in items):
+            items.sort(key=lambda item: item[0])
+        super()._batch_setitems(items, *args)
+
+
+def canonical(obj, sort=False):
+    """Bytes that are equal for equal types, values and references between them."""
+    stream = io.BytesIO()
+    pickler = Canonical(stream, 4)
+    pickler.sort = sort
+    pickler.dump(obj)
+    return stream.getvalue()
 
 
 def attributes(root):
@@ -58,16 +70,19 @@ def attributes(root):
 
 def compare_paths(tmp):
     """Every path of the original must partially load to the same thing here."""
-    n_orig = n_poc = n_common = 0
+    cases = build_cases()
+    n_orig = n_poc = n_common = n_reordered = 0
+    like_pickle = collections.Counter()
     missing = collections.Counter()
     problems = []
-    for name, obj in build_cases().items():
+    for name, obj in cases.items():
         orig, poc = f"{tmp}/{name}_orig.h5", f"{tmp}/{name}_poc.h5"
         boh.H5Bag.save(obj, orig)
         h5pickle.dump(obj, poc)
-        if not same(obj, h5pickle.load(poc)):
-            problems.append(f"{name}: full round trip differs")
         bag = boh.H5Bag(orig)
+        reference = canonical(pickle.loads(pickle.dumps(obj, 4)))
+        like_pickle["original"] += canonical(bag.load()) == reference
+        like_pickle["poc"] += canonical(h5pickle.load(poc)) == reference
         orig_paths, poc_paths = set(bag.list_paths()), set(h5pickle.list_paths(poc))
         n_orig, n_poc = n_orig + len(orig_paths), n_poc + len(poc_paths)
         for path in sorted(orig_paths - poc_paths):
@@ -77,13 +92,20 @@ def compare_paths(tmp):
         for path in sorted(orig_paths & poc_paths):
             n_common += 1
             a, b = bag.load(path), h5pickle.load(poc, path)
-            if not same(a, b):
+            if canonical(a, sort=True) != canonical(b, sort=True):
                 problems.append(
                     f"{name}: partial load differs at {path}\n"
                     f"      original holds {attributes(a)}\n"
                     f"      poc holds      {attributes(b)}"
                 )
+            elif canonical(a) != canonical(b):
+                n_reordered += 1
+    print(
+        f"full loads identical to a plain pickle round trip, of {len(cases)}: "
+        f"original {like_pickle['original']}, poc {like_pickle['poc']}"
+    )
     print(f"paths: original {n_orig}, poc {n_poc}, partial loads compared {n_common}")
+    print(f"  of those, equal but for the order of string-keyed dicts: {n_reordered}")
     print("original paths without a poc counterpart, by last path element (content):")
     for what, n in missing.most_common():
         print(f"  {n:4d} x {what}")
