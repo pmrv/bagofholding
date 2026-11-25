@@ -189,12 +189,17 @@ class H5Bag(Bag, HasH5FileContext, StringArrayPacker):
                 attrs[k] = v
 
     def unpack_metadata(self, path: str) -> Metadata:
-        attrs = self._resolve(path).attrs
-        fields = {
-            k: self.maybe_decode(attrs[k])
-            for k in attrs
-            if k in Metadata.__dataclass_fields__
-        }
+        try:
+            attrs = self._resolve(path).attrs
+        except KeyError:
+            # A missing path is reported like missing metadata, as for other bags
+            fields: dict[str, str] = {}
+        else:
+            fields = {
+                k: self.maybe_decode(attrs[k])
+                for k in attrs
+                if k in Metadata.__dataclass_fields__
+            }
         content_type = fields.pop("content_type", None)
         if content_type is None:
             raise InvalidMetadataError(f"Metadata at {path} is missing a content type")

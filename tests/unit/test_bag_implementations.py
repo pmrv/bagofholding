@@ -31,6 +31,7 @@ import bagofholding.h5.triebag
 from bagofholding import (
     BagMismatchError,
     EnvironmentMismatchError,
+    InvalidMetadataError,
     ModuleForbiddenError,
     NoVersionError,
     PickleProtocolError,
@@ -661,6 +662,14 @@ class AbstractTestNamespace:
             self.assertIs(reloaded["arr"][3], Phase.FCC)
             self.assertIs(reloaded["cyclic"][0], reloaded["cyclic"])
             self.assertEqual(reloaded["cyclic"][1], "not a cycle")
+
+        def test_missing_path(self):
+            self.bag_class().save({"a": 1}, self.save_name)
+            bag = self.bag_class()(self.save_name)
+            with self.assertRaises(InvalidMetadataError):
+                bag["object/not_there"]
+            with self.assertRaises(InvalidMetadataError):
+                bag.load("object/not_there")
 
         def test_subaccess(self):
             r = Recursing(2)
