@@ -34,6 +34,7 @@ import bagofholding.h5.triebag
 from bagofholding import (
     BagMismatchError,
     EnvironmentMismatchError,
+    InvalidMetadataError,
     ModuleForbiddenError,
     NoVersionError,
     PickleProtocolError,
@@ -720,6 +721,14 @@ class AbstractTestNamespace:
                 self.assertEqual(obj_a, CustomExtBag(f"{file_path}/a").load())
                 self.assertEqual(obj_b, CustomExtBag(f"{file_path}/b").load())
 
+        def test_missing_path(self):
+            self.bag_class().save({"a": 1}, self.save_name)
+            bag = self.bag_class()(self.save_name)
+            with self.assertRaises(InvalidMetadataError):
+                bag["object/not_there"]
+            with self.assertRaises(InvalidMetadataError):
+                bag.load("object/not_there")
+
         def test_subaccess(self):
             r = Recursing(2)
             self.bag_class().save(r, self.save_name)
@@ -861,6 +870,27 @@ class TestH5BagBagImplementation(AbstractTestNamespace.TestBagImplementation):
     @classmethod
     def bag_class(cls) -> type[bagofholding.h5.bag.H5Bag]:
         return bagofholding.h5.bag.H5Bag
+
+    def test_group_cache_eviction(self):
+        """
+        Groups are cached by path while packing and unpacking; objects with more
+        groups than the cache holds must still round-trip, and partial loads must
+        resolve correctly whether or not their ancestors are cached.
+        """
+        bag_class = self.bag_class()
+        n = 2 * bag_class._group_cache_size
+        obj = {f"k{i}": {"inner": [i, {"leaf": str(i)}]} for i in range(n)}
+
+        bag_class.save(obj, self.save_name)
+        bag = bag_class(self.save_name)
+        self.assertEqual(obj, bag.load())
+        with bag:
+            for i in (0, n // 2, n - 1, 0):
+                self.assertEqual(
+                    str(i), bag.load(f"object/k{i}/inner/i1/leaf"), msg=f"k{i}"
+                )
+            self.assertLessEqual(len(bag._groups), bag_class._group_cache_size)
+        self.assertEqual(0, len(bag._groups), msg="Cache is cleared on close")
 
 
 class TestH5TrieBagBagImplementation(AbstractTestNamespace.TestBagImplementation):

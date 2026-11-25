@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import dataclasses
 import pathlib
 from typing import Any, ClassVar, Self, cast
@@ -9,7 +10,7 @@ import numpy as np
 
 from bagofholding.bag import Bag, BagInfo
 from bagofholding.content import BespokeItem, has_surrogates
-from bagofholding.exceptions import NotAGroupError
+from bagofholding.exceptions import InvalidMetadataError, NotAGroupError
 from bagofholding.h5.content import Array, ArrayPacker, ArrayType, int_overflows
 from bagofholding.h5.context import HasH5FileContext
 from bagofholding.h5.dtypes import H5PY_DTYPE_WHITELIST
@@ -30,6 +31,12 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
     """
 
     _content_key: ClassVar[str] = "content_type"
+    _group_cache_size: ClassVar[int] = 256
+    # Groups are cached by path so children can be created and resolved relative to
+    # their parent: h5py resolving a deep path walks every component again, which
+    # dominates save/load time for objects with many nodes. Packing and unpacking
+    # are depth-first, so a small LRU holding the recent ancestors suffices and keeps
+    # the number of open HDF5 handles bounded.
 
     @classmethod
     def get_bag_info(cls) -> BagInfo:
@@ -51,6 +58,9 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
         self._context_depth = 0
         self._parsed_path = None
         self._working_root = None
+        self._groups: collections.OrderedDict[str, h5py.Group] = (
+            collections.OrderedDict()
+        )
         super().__init__(filepath, *args, **kwargs)
 
     def _load_existing_bag_info(self) -> BagInfo | None:
@@ -117,8 +127,44 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
             self.open("r")
         return self
 
+    def close(self) -> None:
+        self._groups.clear()
+        super().close()
+
+    def _cache_group(self, path: str, group: h5py.Group) -> h5py.Group:
+        self._groups[path] = group
+        if len(self._groups) > self._group_cache_size:
+            self._groups.popitem(last=False)
+        return group
+
+    def _resolve_group(self, path: str) -> h5py.Group:
+        path = path.strip("/")
+        if path == "":
+            return self.file
+        group = self._groups.get(path)
+        if group is not None:
+            self._groups.move_to_end(path)
+            return group
+        return self._cache_group(path, self.file[path])
+
+    def _split(self, path: str) -> tuple[h5py.Group, str]:
+        """The (cached) parent group of a path, and the path's final component."""
+        parent_path, _, name = path.strip("/").rpartition("/")
+        return self._resolve_group(parent_path), name
+
     def _resolve(self, path: str) -> h5py.Group | h5py.Dataset:
-        return self.file if path in ("/", "") else self.file[path]
+        path = path.strip("/")
+        if path == "":
+            return self.file
+        group = self._groups.get(path)
+        if group is not None:
+            return group
+        parent, name = self._split(path)
+        return parent[name]
+
+    def _create_dataset(self, path: str, **kwargs: Any) -> h5py.Dataset:
+        parent, name = self._split(path)
+        return parent.create_dataset(name, **kwargs)
 
     def _pack_field(self, path: str, key: str, value: str) -> None:
         self._resolve(path).attrs[key] = value
@@ -129,32 +175,56 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
         except KeyError:
             return None
 
+    def pack_metadata(self, metadata: Metadata, path: str) -> None:
+        attrs = self._resolve(path).attrs
+        for k, v in metadata.field_items():
+            if v is not None:
+                attrs[k] = v
+
+    def unpack_metadata(self, path: str) -> Metadata:
+        try:
+            attrs = self._resolve(path).attrs
+        except KeyError:
+            # A missing path is reported like missing metadata, as for other bags
+            fields: dict[str, str] = {}
+        else:
+            fields = {
+                k: self.maybe_decode(attrs[k])
+                for k in attrs
+                if k in Metadata.__dataclass_fields__
+            }
+        content_type = fields.pop("content_type", None)
+        if content_type is None:
+            raise InvalidMetadataError(f"Metadata at {path} is missing a content type")
+        return Metadata(content_type, **fields)
+
     def pack_empty(self, path: str) -> None:
-        self.file.create_dataset(path, data=h5py.Empty(dtype="f"))
+        self._create_dataset(path, data=h5py.Empty(dtype="f"))
 
     def pack_string(self, obj: str, path: str) -> None:
         if has_surrogates(obj):
             encoded = obj.encode("utf-16", errors="surrogatepass")
-            self.file.create_dataset(path, data=np.void(encoded))
-            self.file[path].attrs["_surrogate_str"] = True
+            dataset = self._create_dataset(path, data=np.void(encoded))
+            dataset.attrs["_surrogate_str"] = True
         else:
-            self.file.create_dataset(
+            self._create_dataset(
                 path, data=obj, dtype=h5py.string_dtype(encoding="utf-8")
             )
 
     def unpack_string(self, path: str) -> str:
-        if self.file[path].attrs.get("_surrogate_str", False):
+        dataset = self._resolve(path)
+        if dataset.attrs.get("_surrogate_str", False):
             return cast(
                 str,
-                self.file[path][()].tobytes().decode("utf-16", errors="surrogatepass"),
+                dataset[()].tobytes().decode("utf-16", errors="surrogatepass"),
             )
-        return cast(str, self._unpack_raw(path).decode("utf-8"))
+        return cast(str, dataset[()].decode("utf-8"))
 
     def _pack_raw(self, obj: bytearray | bool | int | float, path: str) -> None:
-        self.file.create_dataset(path, data=obj)
+        self._create_dataset(path, data=obj)
 
     def _unpack_raw(self, path: str) -> Any:
-        return self.file[path][()]
+        return self._resolve(path)[()]
 
     def pack_bool(self, obj: bool, path: str) -> None:
         return self._pack_raw(obj, path)
@@ -164,17 +234,18 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
 
     def pack_long(self, obj: int, path: str) -> None:
         if int_overflows(obj):
-            self.file.create_dataset(
+            dataset = self._create_dataset(
                 path, data=str(obj), dtype=h5py.string_dtype(encoding="utf-8")
             )
-            self.file[path].attrs["_bigint"] = True
+            dataset.attrs["_bigint"] = True
         else:
             self._pack_raw(obj, path)
 
     def unpack_long(self, path: str) -> int:
-        if self.file[path].attrs.get("_bigint", False):
-            return int(self._unpack_raw(path).decode("utf-8"))
-        return int(self._unpack_raw(path))
+        dataset = self._resolve(path)
+        if dataset.attrs.get("_bigint", False):
+            return int(dataset[()].decode("utf-8"))
+        return int(dataset[()])
 
     def pack_float(self, obj: float, path: str) -> None:
         return self._pack_raw(obj, path)
@@ -183,7 +254,7 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
         return float(self._unpack_raw(path))
 
     def pack_complex(self, obj: complex, path: str) -> None:
-        self.file.create_dataset(path, data=np.array([obj.real, obj.imag]))
+        self._create_dataset(path, data=np.array([obj.real, obj.imag]))
 
     def unpack_complex(self, path: str) -> complex:
         data = self._unpack_raw(path)
@@ -192,9 +263,9 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
     def pack_bytes(self, obj: bytes, path: str) -> None:
         if obj == b"":
             special = h5py.special_dtype(vlen=bytes)
-            self.file.create_dataset(path, data=b"", dtype=special)
+            self._create_dataset(path, data=b"", dtype=special)
         else:
-            self.file.create_dataset(path, data=np.void(obj))
+            self._create_dataset(path, data=np.void(obj))
 
     def unpack_bytes(self, path: str) -> bytes:
         return bytes(self._unpack_raw(path))
@@ -206,11 +277,12 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
         return bytearray(self._unpack_raw(path))
 
     def create_group(self, path: str) -> None:
-        self.file.create_group(path)
+        parent, name = self._split(path)
+        self._cache_group(path.strip("/"), parent.create_group(name))
 
     def open_group(self, path: str) -> list[str]:
         with self:
-            group = self.file[path]
+            group = self._resolve(path)
             if not isinstance(group, h5py.Group):
                 raise NotAGroupError(f"Asked a group at {path}, got {type(group)}")
             subcontent_names = list(group)
@@ -225,7 +297,7 @@ class H5Bag(Bag, HasH5FileContext, ArrayPacker):
         return None
 
     def pack_array(self, obj: ArrayType, path: str) -> None:
-        self.file.create_dataset(path, data=obj)
+        self._create_dataset(path, data=obj)
 
     def unpack_array(self, path: str) -> ArrayType:
-        return cast(ArrayType, self.file[path][()])
+        return cast(ArrayType, self._resolve(path)[()])
