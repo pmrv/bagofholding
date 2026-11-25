@@ -30,6 +30,7 @@ import bagofholding.h5.triebag
 from bagofholding import (
     BagMismatchError,
     EnvironmentMismatchError,
+    InvalidMetadataError,
     ModuleForbiddenError,
     NoVersionError,
     PickleProtocolError,
@@ -604,6 +605,14 @@ class AbstractTestNamespace:
                 CustomExtBag.save(obj_b, f"{file_path}/b")
                 self.assertEqual(obj_a, CustomExtBag(f"{file_path}/a").load())
                 self.assertEqual(obj_b, CustomExtBag(f"{file_path}/b").load())
+
+        def test_missing_path(self):
+            self.bag_class().save({"a": 1}, self.save_name)
+            bag = self.bag_class()(self.save_name)
+            with self.assertRaises(InvalidMetadataError):
+                bag["object/not_there"]
+            with self.assertRaises(InvalidMetadataError):
+                bag.load("object/not_there")
 
         def test_subaccess(self):
             r = Recursing(2)
