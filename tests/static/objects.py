@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 from typing import SupportsIndex
 
 import numpy as np
@@ -159,3 +160,11 @@ class Recursing:
 
 
 is_a_lambda = lambda x: isinstance(x, int)  # noqa: E731
+
+
+class Phase(enum.StrEnum):
+    """String enum members are typical (shared) entries of pandas object columns."""
+
+    FCC = "fcc"
+    HCP = "hcp"
+    LIQUID = "liquid"
